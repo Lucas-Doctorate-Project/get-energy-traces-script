@@ -165,7 +165,6 @@ def get_generation_df(
     df.iloc[:, 2:] = df.iloc[:, 2:].apply(pd.to_numeric, errors='coerce')
     df = df.fillna(0)
 
-    df.to_csv("aux.csv", index=False)
     
     return df
 
@@ -248,7 +247,6 @@ def fix_time_intervals(
 
     df = df.sort_values("start_time").reset_index(drop=True)
 
-    df.to_csv("aux_toutc.csv", index=False)
 
     rows: list[dict] = []
     i = 0
