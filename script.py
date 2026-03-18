@@ -19,6 +19,9 @@ carbon = data['carbon']
 water = data['water']
 
 # define dictionaries for carbon and water intensities
+# https://colab.research.google.com/drive/1vPR_nndzlkHKROMDinlpXU3XWIxTfFQx?usp=sharing
+
+
 carbon_intensities = {
     "Biomass": carbon["biomass-ipcc-2014"],
     "Fossil Gas": carbon["gas-ngcc-unece-2020"],
@@ -161,6 +164,8 @@ def get_generation_df(
     # convert all columns except the first/second one to numeric
     df.iloc[:, 2:] = df.iloc[:, 2:].apply(pd.to_numeric, errors='coerce')
     df = df.fillna(0)
+
+    df.to_csv("aux.csv", index=False)
     
     return df
 
@@ -217,11 +222,7 @@ def divide_into_seasons(
 
 def fix_time_intervals(
     df: pd.DataFrame
-) -> pd.DataFrame | int:
-    # only merge consecutive rows (no splitting).
-    # Accumulate rows until their total duration reaches (or exceeds)
-    # the maximum interval present in the dataframe
-
+) -> tuple[pd.DataFrame, int]:
     df = df.copy()
 
     # Normalize to UTC before computing intervals/slots (avoids DST distortions)
@@ -238,50 +239,150 @@ def fix_time_intervals(
     df["start_time"] = _to_utc(df["start_time"])
     df["end_time"] = _to_utc(df["end_time"])
 
-    df["interval_minutes"] = (df["end_time"] - df["start_time"]).dt.total_seconds() / 60.0
-    mx = int(df["interval_minutes"].max())
+    target_minutes = 60
 
-    rows = []
-    acc_start = None
-    # Accumulate duration-weighted intensities 
-    acc_carbon = 0.0  # sum(carbon_intensity * minutes)
-    acc_water = 0.0   # sum(water_intensity * minutes)
-    acc_duration = 0.0
+    interval_series = (df["end_time"] - df["start_time"]).dt.total_seconds() / 60.0
+    df["interval_minutes"] = interval_series.round().astype(int)
+    if (df["interval_minutes"] <= 0).any():
+        raise ValueError("Found non-positive time interval in data")
 
-    for _, row in df.sort_values("start_time").iterrows():
-        dur = float(row["interval_minutes"])
+    df = df.sort_values("start_time").reset_index(drop=True)
+
+    df.to_csv("aux_toutc.csv", index=False)
+
+    rows: list[dict] = []
+    i = 0
+    n = len(df)
+
+    while i < n:
+        row = df.iloc[i]
+        dur = int(row["interval_minutes"])
         c = float(row.get("carbon_intensity", 0.0))
         w = float(row.get("water_intensity", 0.0))
 
-        if acc_start is None:
-            acc_start = row["start_time"]
+        if dur == target_minutes:
+            rows.append({
+                "start_time": row["start_time"],
+                "end_time": row["end_time"],
+                "carbon_intensity": c,
+                "water_intensity": w,
+                "interval": target_minutes,
+            })
+            i += 1
+            continue
 
-        acc_carbon += c * dur
-        acc_water += w * dur
-        acc_duration += dur
+        if dur < target_minutes:
+            if target_minutes % dur != 0:
+                raise ValueError(
+                    f"Interval {dur} minutes does not divide {target_minutes}; cannot normalize to {target_minutes} minutes"
+                )
+            group_size = target_minutes // dur
 
-        # when accumulated duration reaches or exceeds mx, emit a merged row
-        if acc_duration >= mx:
-            out_start = acc_start
-            out_end = row["end_time"]
-            interval_minutes = int(round(acc_duration))
-            carbon_avg = (acc_carbon / acc_duration) if acc_duration else 0.0
-            water_avg = (acc_water / acc_duration) if acc_duration else 0.0
+            # Fast path: strict aggregation of exactly group_size equal-duration rows.
+            if i + group_size <= n:
+                grp = df.iloc[i : i + group_size]
+                if (grp["interval_minutes"] == dur).all():
+                    starts = grp["start_time"].to_list()
+                    ends = grp["end_time"].to_list()
+                    for j in range(1, len(grp)):
+                        if starts[j] != ends[j - 1]:
+                            raise ValueError(
+                                "Non-contiguous time intervals while aggregating to 60 minutes; cannot safely average"
+                            )
+
+                    rows.append({
+                        "start_time": grp.iloc[0]["start_time"],
+                        "end_time": grp.iloc[-1]["end_time"],
+                        "carbon_intensity": float(grp["carbon_intensity"].mean()),
+                        "water_intensity": float(grp["water_intensity"].mean()),
+                        "interval": target_minutes,
+                    })
+                    i += group_size
+                    continue
+
+            # Fallback: accumulate contiguous rows until total duration hits a multiple
+            # of 60 minutes; then take a duration-weighted mean and replicate per hour.
+            block_start = df.iloc[i]["start_time"]
+            current_end = df.iloc[i]["start_time"]
+            total_span = 0
+            block_end_index = None
+
+            for j in range(i, n):
+                r = df.iloc[j]
+                if j > i and r["start_time"] != current_end:
+                    raise ValueError(
+                        "Non-contiguous time intervals while normalizing to 60 minutes; cannot safely average"
+                    )
+                d = int(r["interval_minutes"])
+                if d <= 0:
+                    raise ValueError("Found non-positive time interval in data")
+
+                total_span += d
+                current_end = r["end_time"]
+
+                if total_span >= target_minutes and (total_span % target_minutes) == 0:
+                    block_end_index = j
+                    break
+
+            if block_end_index is None:
+                raise ValueError(
+                    f"Could not accumulate a contiguous block to a multiple of {target_minutes} minutes starting at {block_start}"
+                )
+
+            block = df.iloc[i : block_end_index + 1]
+            block_start_ts = block.iloc[0]["start_time"]
+            block_end_ts = block.iloc[-1]["end_time"]
+            print(
+                "[fix_time_intervals] Fallback used: merged "
+                f"{len(block)} rows (from {block_start_ts} to {block_end_ts}) into "
+                f"{total_span // target_minutes} hour(s) before splitting to 60-minute rows"
+            )
+            for _, r in block.iterrows():
+                print(
+                    "[fix_time_intervals]   merged-row: "
+                    f"start_time={r['start_time']}, end_time={r['end_time']}, interval={int(r['interval_minutes'])}min"
+                )
+            weights = block["interval_minutes"].astype(float)
+            carbon_avg = float((block["carbon_intensity"] * weights).sum() / weights.sum())
+            water_avg = float((block["water_intensity"] * weights).sum() / weights.sum())
+
+            repeat = total_span // target_minutes
+            for k in range(repeat):
+                out_start = block_start + pd.Timedelta(minutes=target_minutes * k)
+                out_end = out_start + pd.Timedelta(minutes=target_minutes)
+                rows.append({
+                    "start_time": out_start,
+                    "end_time": out_end,
+                    "carbon_intensity": carbon_avg,
+                    "water_intensity": water_avg,
+                    "interval": target_minutes,
+                })
+
+            i = block_end_index + 1
+            continue
+
+        # dur > target_minutes
+        if dur % target_minutes != 0:
+            raise ValueError(
+                f"Interval {dur} minutes is not a multiple of {target_minutes}; cannot split into {target_minutes}-minute steps"
+            )
+
+        repeat = dur // target_minutes
+        base_start = row["start_time"]
+        for k in range(repeat):
+            out_start = base_start + pd.Timedelta(minutes=target_minutes * k)
+            out_end = out_start + pd.Timedelta(minutes=target_minutes)
             rows.append({
                 "start_time": out_start,
                 "end_time": out_end,
-                "carbon_intensity": carbon_avg,
-                "water_intensity": water_avg,
-                "interval": interval_minutes,
+                "carbon_intensity": c,
+                "water_intensity": w,
+                "interval": target_minutes,
             })
-            # reset accumulator
-            acc_start = None
-            acc_carbon = 0.0
-            acc_water = 0.0
-            acc_duration = 0.0
+        i += 1
 
     out = pd.DataFrame(rows)
-    return out, mx
+    return out, target_minutes
 
 def get_week(
     df: pd.DataFrame
@@ -294,7 +395,9 @@ def get_week(
     df["year"] = df["start_time"].dt.year
     df["month"] = df["start_time"].dt.month
     df["day_of_week"] = df["start_time"].dt.dayofweek
-    df["day_slot"] = df["start_time"].dt.hour * 4 + (df["start_time"].dt.minute) // 15
+    # slot index within the day, based on the normalized interval (mx minutes)
+    slots_per_hour = 60 // mx
+    df["day_slot"] = df["start_time"].dt.hour * slots_per_hour + (df["start_time"].dt.minute) // mx
 
     week_mean = df.groupby(["day_of_week","day_slot"]).mean(numeric_only=True).reset_index()
 
@@ -304,7 +407,7 @@ def get_week(
     def attach_canonical_week(agg_df: pd.DataFrame) -> pd.DataFrame:
         out = agg_df.copy()
         start_utc = base + pd.to_timedelta(
-            out["day_of_week"] * 24 * 60 + out["day_slot"] * 15,
+            out["day_of_week"] * 24 * 60 + out["day_slot"] * mx,
             unit="m"
         )
         out["start_time"] = start_utc
@@ -315,10 +418,31 @@ def get_week(
 
     return week[["start_time", "end_time", "carbon_intensity", "water_intensity"]], mx
 
-countries = ['FR', 'DE', 'PL']
+
+def format_for_seconds_export(
+    df: pd.DataFrame,
+    interval_minutes: int,
+) -> pd.DataFrame:
+    out = df.copy().reset_index(drop=True)
+    out.insert(
+        0,
+        "timestamp",
+        (np.arange(len(out), dtype=np.int64) * int(interval_minutes) * 60).astype(np.int64),
+    )
+    # Keep only one time column (timestamp), plus intensities
+    cols = ["timestamp"]
+    for c in ["carbon_intensity", "water_intensity"]:
+        if c in out.columns:
+            cols.append(c)
+    return out[cols]
+
+countries = ['PL', 'DE']
 years = range(2015, 2025+1)
 
 for country in countries:
+    season_weeks: dict[str, list[pd.DataFrame]] = {"summer": [], "autumn": [], "winter": [], "spring": []}
+    season_mx: dict[str, int] = {}
+
     for year in years:
         df = get_generation_df(country, year)
 
@@ -326,7 +450,37 @@ for country in countries:
         df_seasons = divide_into_seasons(df_intensities, year)
 
         for season in df_seasons.keys():
-            # fixs time intervals before
+            # fixed to 60-minute resolution, then build canonical week
             week, mx = get_week(df_seasons[season])
-            week.to_csv(f"./generated_csv/{country}_{year}_{season}_res={mx}min.csv", index=False)
+            # week.to_csv(f"./generated_csv/{country}_{year}_{season}_res={mx}min.csv", index=False)
+
+            season_weeks[season].append(week)
+            if season in season_mx and season_mx[season] != mx:
+                raise ValueError(
+                    f"Inconsistent normalized interval for {country} {season}: {season_mx[season]} vs {mx}"
+                )
+            season_mx[season] = mx
+
+    # Merge across years: for each equivalent hour (canonical start_time), take mean across years
+    min_year = min(years)
+    max_year = max(years)
+    for season, weeks_list in season_weeks.items():
+        if not weeks_list:
+            continue
+
+        mx = season_mx.get(season, 60)
+        merged = pd.concat(weeks_list, ignore_index=True)
+        merged_mean = (
+            merged
+            .groupby(["start_time"], as_index=False)
+            .mean(numeric_only=True)
+            .sort_values("start_time")
+        )
+        merged_mean["end_time"] = merged_mean["start_time"] + pd.to_timedelta(mx, unit="m")
+        merged_mean = merged_mean[["start_time", "end_time", "carbon_intensity", "water_intensity"]]
+        merged_mean = format_for_seconds_export(merged_mean, mx)
+        merged_mean.to_csv(
+            f"./generated_csv/{country}_{season}.csv",
+            index=False,
+        )
 
