@@ -18,6 +18,7 @@ with open('intensities.json', 'r') as f:
 carbon = data['carbon']
 water = data['water']
 
+'''
 # define dictionaries for carbon and water intensities
 # https://colab.research.google.com/drive/1vPR_nndzlkHKROMDinlpXU3XWIxTfFQx?usp=sharing
 
@@ -95,6 +96,25 @@ water_intensities = {
     "Fossil Oil": 0.0,
     "Hydro Pumped Storage": 0.0
 }
+'''
+
+# straightforward intensities
+# obtained from the experiments repo:
+# energy-data/scrap_energy_mix.py
+
+carbon_intensities = {
+    "Biomass": 230, "Fossil Gas": 280, "Fossil Hard coal": 630, "Fossil Oil": 280,
+    "Hydro Pumped Storage": 81, "Hydro Run-of-river and pondage": 81, "Hydro Water Reservoir": 81,
+    "Nuclear": 5.1, "Solar": 21, "Waste": 230,
+    "Wind Offshore": 13, "Wind Onshore": 12, "Energy storage": 21,
+}
+water_intensities = {
+    "Biomass": 1.147, "Fossil Gas": 1.086, "Fossil Hard coal": 1.802, "Fossil Oil": 1.086,
+    "Hydro Pumped Storage": 17.0, "Hydro Run-of-river and pondage": 17.0, "Hydro Water Reservoir": 17.0,
+    "Nuclear": 1.957, "Solar": 0.004, "Waste": 1.147,
+    "Wind Offshore": 0, "Wind Onshore": 0, "Energy storage": 0.004,
+}
+
 
 
 # all the entsoe production types
@@ -434,8 +454,8 @@ def format_for_seconds_export(
             cols.append(c)
     return out[cols]
 
-countries = ['PL', 'DE']
-years = range(2015, 2025+1)
+countries = ['FR', 'DE', 'PL']
+years = range(2023, 2025+1)
 
 for country in countries:
     season_weeks: dict[str, list[pd.DataFrame]] = {"summer": [], "autumn": [], "winter": [], "spring": []}
@@ -478,7 +498,7 @@ for country in countries:
         merged_mean = merged_mean[["start_time", "end_time", "carbon_intensity", "water_intensity"]]
         merged_mean = format_for_seconds_export(merged_mean, mx)
         merged_mean.to_csv(
-            f"./generated_csv/{country}_{season}.csv",
+            f"./generated_csv2023/{country}_{season}.csv",
             index=False,
         )
 
